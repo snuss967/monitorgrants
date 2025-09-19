@@ -63,8 +63,8 @@ EMAIL_SUBJECT_PREFIX = os.environ.get("EMAIL_SUBJECT_PREFIX", "[Award Watch]").s
 DRY_RUN = os.environ.get("DRY_RUN", "0").strip() == "1"
 
 # Playwright timeouts (ms)
-NAV_TIMEOUT_MS = 60_000
-TABLE_TIMEOUT_MS = 60_000
+NAV_TIMEOUT_MS = 10_000
+TABLE_TIMEOUT_MS = 10_000
 
 
 # --------------------
