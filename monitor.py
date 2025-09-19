@@ -281,118 +281,125 @@ def send_email_digest(
 # Scraping
 # --------------------
 
+MAX_SCRAPE_RETRIES = 3
+
 def scrape_table_rows(page, url: str) -> Tuple[List[str], List[Dict[str, str]]]:
-    """
-    Navigate to the page, wait for table at the given XPath, expand 'Read More' buttons,
-    then return (headers, rows_as_dict_list).
-    """
-    page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-
-    # Some pages display cookie banners; attempt to dismiss common ones (best-effort, ignore failures)
-    for sel in [
-        'button:has-text("Accept")',
-        'button:has-text("Accept All")',
-        'button:has-text("I Agree")',
-        'button:has-text("Got it")',
-    ]:
+    last_err = None
+    for attempt in range(1, MAX_SCRAPE_RETRIES + 1):
         try:
-            if page.is_visible(sel, timeout=1500):
-                page.click(sel)
-        except Exception:
-            pass
+            page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+            # Let XHRs settle a bit
+            try:
+                page.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:
+                pass  # don't fail just because network stays chatty
 
-    # Wait for the results table container
-    container = page.wait_for_selector(TABLE_XPATH, state="visible", timeout=TABLE_TIMEOUT_MS)
+            # Best-effort: ensure the "Transactions" tab is active
+            try:
+                tab = page.get_by_role("tab", name=re.compile(r"^Transactions", re.I))
+                if tab.is_visible():
+                    tab.click(timeout=2000)
+            except Exception:
+                pass
 
-    # Expand all 'Read More' buttons inside the container (to get full text)
-    expand_read_more_safely(page, TABLE_XPATH)
+            # Wait for container + real rows
+            page.wait_for_selector(TABLE_XPATH, state="visible", timeout=TABLE_TIMEOUT_MS)
+            wait_for_table_rows(page, TABLE_XPATH, min_rows=1, timeout_ms=ROW_TIMEOUT_MS)
 
-    # Grab the table element (first table under the container)
-    table = page.query_selector(f"{TABLE_XPATH}//table")
-    if table is None:
-        # Some pages render with data table virtualization; try inner HTML fallback
-        html = container.inner_html()
-        raise RuntimeError("Could not find <table> under results-table-content; page layout may have changed.")
+            # Expand details safely
+            expand_read_more_safely(page, TABLE_XPATH)
 
-    # Extract headers robustly: get header label text only (exclude sort icons)
-    headers: List[str] = table.evaluate(
-        """(el) => {
-            // Collect header labels; target the label container if present
-            const hs = [];
-            const ths = el.querySelectorAll('thead th');
-            for (const th of ths) {
-                let label = '';
-                const lbl = th.querySelector('.table-header__label');
-                if (lbl) {
-                    // Often like "Modification Number" with nested sort buttons
-                    // Grab only the first text node content
-                    for (const node of lbl.childNodes) {
-                        if (node.nodeType === Node.TEXT_NODE) {
-                            label = (node.textContent || '').trim();
-                            if (label) break;
+            # Extract
+            table = page.query_selector(f"{TABLE_XPATH}//table")
+            if table is None:
+                raise RuntimeError("Results table not found under container.")
+
+            headers: List[str] = table.evaluate(
+                """(el) => {
+                    const hs = [];
+                    for (const th of el.querySelectorAll('thead th')) {
+                        let t = '';
+                        const lbl = th.querySelector('.table-header__label');
+                        if (lbl) {
+                            for (const node of lbl.childNodes) {
+                                if (node.nodeType === Node.TEXT_NODE) {
+                                    t = (node.textContent || '').trim();
+                                    if (t) break;
+                                }
+                            }
+                            if (!t) t = (lbl.textContent || '').trim();
+                        } else {
+                            t = (th.textContent || '').trim();
                         }
+                        t = t.replace(/\\s+/g, ' ').trim();
+                        if (t) hs.push(t);
                     }
-                    if (!label) label = (lbl.textContent || '').trim();
-                } else {
-                    label = (th.textContent || '').trim();
-                }
-                label = label.replace(/\\s+/g, ' ').trim();
-                if (label) hs.push(label);
-            }
-            return hs;
-        }"""
-    )
+                    return hs;
+                }"""
+            )
 
-    # Extract body rows (visible text)
-    rows: List[List[str]] = table.evaluate(
-        """(el) => {
-            const out = [];
-            const trs = el.querySelectorAll('tbody tr');
-            for (const tr of trs) {
-                const tds = tr.querySelectorAll('td');
-                const row = [];
-                for (const td of tds) {
-                    // innerText returns visible text (after 'Read More' expanded)
-                    let t = td.innerText || '';
-                    t = t.replace(/\\s+/g, ' ').trim();
-                    row.push(t);
-                }
-                if (row.length > 0) out.push(row);
-            }
-            return out;
-        }"""
-    )
+            rows: List[List[str]] = table.evaluate(
+                """(el) => {
+                    const out = [];
+                    for (const tr of el.querySelectorAll('tbody tr')) {
+                        const row = [];
+                        for (const td of tr.querySelectorAll('td')) {
+                            let t = td.innerText || '';
+                            t = t.replace(/\\s+/g, ' ').trim();
+                            row.push(t);
+                        }
+                        if (row.length) out.push(row);
+                    }
+                    return out;
+                }"""
+            )
 
-    # Zip into dicts
-    records: List[Dict[str, str]] = []
-    for r in rows:
-        if len(r) != len(headers):
-            # If column count mismatch, pad/truncate conservatively
-            if len(r) < len(headers):
-                r = r + [""] * (len(headers) - len(r))
-            else:
-                r = r[:len(headers)]
-        records.append({h: v for h, v in zip(headers, r)})
+            records: List[Dict[str, str]] = []
+            for r in rows:
+                if len(r) < len(headers):
+                    r = r + [""] * (len(headers) - len(r))
+                elif len(r) > len(headers):
+                    r = r[:len(headers)]
+                records.append({h: v for h, v in zip(headers, r)})
 
-    return headers, records
+            if not records:
+                raise RuntimeError("Table has 0 rows after wait; treating as transient load failure.")
 
+            return headers, records
+
+        except Exception as e:
+            last_err = e
+            # Diagnostics on final failure
+            if attempt == MAX_SCRAPE_RETRIES:
+                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                try:
+                    Path("state").mkdir(exist_ok=True)
+                    page.screenshot(path=f"state/{ts}_fail.png", full_page=True)
+                    Path(f"state/{ts}_fail.html").write_text(page.content(), encoding="utf-8")
+                    print(f"[scrape][DIAG] Saved state/{ts}_fail.png and state/{ts}_fail.html")
+                except Exception:
+                    pass
+                break
+            # Backoff + reload for another try
+            page.wait_for_timeout(500 * attempt)
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+            except Exception:
+                pass
+
+    raise last_err if last_err else RuntimeError("Unknown scrape failure")
+    
 def expand_read_more_safely(page, container_xpath: str, max_passes: int = 8, per_pass_cap: int = 200):
     """
     Expand collapsed 'Read more' toggles without getting stuck.
-    - Click only buttons that look collapsed (aria-expanded='false' OR text contains 'read more')
-    - Stop after max_passes or when none remain
-    - Cap clicks per pass for safety
+    Click only 'read more' (not 'read less'), cap passes and clicks.
     """
     prev_count = None
     for _ in range(max_passes):
         sel = (
             f"{container_xpath}//button"
-            "[contains(@class,'read') and "
-            "("
-            "  (translate(normalize-space(string(.)), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
-            "     contains 'read more')"
-            "  or @aria-expanded='false'"
-            ")]"
+            "[contains(translate(normalize-space(string(.)),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'read more')"
+            " or @aria-expanded='false']"
         )
         loc = page.locator(f"xpath={sel}")
         try:
@@ -401,17 +408,16 @@ def expand_read_more_safely(page, container_xpath: str, max_passes: int = 8, per
             break
 
         if count == 0 or count == prev_count:
-            break  # nothing left or no progress
+            break
         prev_count = count
 
-        # Click each once this pass (capped)
         for i in range(min(count, per_pass_cap)):
             try:
                 loc.nth(i).click(timeout=1000)
             except Exception:
                 pass
 
-        page.wait_for_timeout(250)  # let DOM update
+        page.wait_for_timeout(250)  # let DOM settle
 
 def scrape_all_sites() -> Dict[str, Dict[str, Any]]:
     """
@@ -447,6 +453,28 @@ def scrape_all_sites() -> Dict[str, Dict[str, Any]]:
         browser.close()
     return results
 
+ROW_TIMEOUT_MS = 30_000  # how long to wait for actual table rows
+
+def wait_for_table_rows(page, container_xpath: str, min_rows: int = 1, timeout_ms: int = ROW_TIMEOUT_MS):
+    """
+    Wait until the table under container_xpath has at least min_rows rows in <tbody>.
+    """
+    # Ensure the table exists first
+    page.wait_for_selector(f"{container_xpath}//table", state="attached", timeout=timeout_ms)
+
+    # Now wait for rows to appear (or throw)
+    page.wait_for_function(
+        """
+        (containerXPath, minRows) => {
+            const el = document.evaluate(containerXPath + "//table", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+            if (!el) return false;
+            const rows = el.querySelectorAll("tbody tr");
+            return rows && rows.length >= minRows;
+        }
+        """,
+        arg=[container_xpath, min_rows],
+        timeout=timeout_ms,
+    )
 
 # --------------------
 # Main flow
@@ -474,9 +502,18 @@ def main() -> int:
         old_rows = read_csv_if_exists(csv_path)
 
         if not old_rows:
-            # First time: create the file, do not email (per your spec)
-            print(f"[state] Initializing snapshot for {name} -> {csv_path}")
-            write_csv(csv_path, new_rows)
+            if new_rows:
+                print(f"[state] Initializing snapshot for {name} -> {csv_path}")
+                tmp = csv_path.with_suffix(".csv.tmp")
+                write_csv(tmp, new_rows)
+                tmp.replace(csv_path)  # atomic
+            else:
+                print(f"[state][WARN] {name}: initial scrape returned 0 rows; snapshot not created.")
+            continue
+        
+        # Subsequent runs: skip if scrape is empty
+        if not new_rows:
+            print(f"[warn] {name}: scrape returned 0 rows; keeping previous snapshot and skipping diff.")
             continue
 
         # Detect changes
