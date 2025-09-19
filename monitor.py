@@ -269,7 +269,7 @@ def send_email_digest(
     msg.attach(part2)
 
     context = ssl.create_default_context()
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=60) as server:
         server.ehlo()
         server.starttls(context=context)
         server.login(gmail_username, gmail_app_password)
@@ -305,22 +305,7 @@ def scrape_table_rows(page, url: str) -> Tuple[List[str], List[Dict[str, str]]]:
     container = page.wait_for_selector(TABLE_XPATH, state="visible", timeout=TABLE_TIMEOUT_MS)
 
     # Expand all 'Read More' buttons inside the container (to get full text)
-    try:
-        # Click until none left (some tables paginate or lazily render)
-        while True:
-            buttons = page.query_selector_all(f"{TABLE_XPATH}//button[contains(@class,'read-more-button')]")
-            clicked = 0
-            for b in buttons:
-                try:
-                    b.click()
-                    clicked += 1
-                except Exception:
-                    pass
-            if clicked == 0:
-                break
-            time.sleep(0.3)
-    except Exception:
-        pass
+    expand_read_more_safely(page, TABLE_XPATH)
 
     # Grab the table element (first table under the container)
     table = page.query_selector(f"{TABLE_XPATH}//table")
@@ -391,6 +376,42 @@ def scrape_table_rows(page, url: str) -> Tuple[List[str], List[Dict[str, str]]]:
 
     return headers, records
 
+def expand_read_more_safely(page, container_xpath: str, max_passes: int = 8, per_pass_cap: int = 200):
+    """
+    Expand collapsed 'Read more' toggles without getting stuck.
+    - Click only buttons that look collapsed (aria-expanded='false' OR text contains 'read more')
+    - Stop after max_passes or when none remain
+    - Cap clicks per pass for safety
+    """
+    prev_count = None
+    for _ in range(max_passes):
+        sel = (
+            f"{container_xpath}//button"
+            "[contains(@class,'read') and "
+            "("
+            "  (translate(normalize-space(string(.)), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+            "     contains 'read more')"
+            "  or @aria-expanded='false'"
+            ")]"
+        )
+        loc = page.locator(f"xpath={sel}")
+        try:
+            count = loc.count()
+        except Exception:
+            break
+
+        if count == 0 or count == prev_count:
+            break  # nothing left or no progress
+        prev_count = count
+
+        # Click each once this pass (capped)
+        for i in range(min(count, per_pass_cap)):
+            try:
+                loc.nth(i).click(timeout=1000)
+            except Exception:
+                pass
+
+        page.wait_for_timeout(250)  # let DOM update
 
 def scrape_all_sites() -> Dict[str, Dict[str, Any]]:
     """
@@ -406,7 +427,10 @@ def scrape_all_sites() -> Dict[str, Dict[str, Any]]:
             ),
             viewport={"width": 1366, "height": 900},
         )
+        
         page = context.new_page()
+        page.set_default_timeout(15_000)
+        page.set_default_navigation_timeout(15_000)
 
         for name, url in SITES.items():
             print(f"[scrape] {name}: {url}")
