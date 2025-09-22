@@ -15,13 +15,11 @@ Author: you
 import os
 import re
 import sys
-import time
 import json
 import csv
-import shutil
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Tuple, Any
 
 # 3rd party
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -29,7 +27,6 @@ import smtplib
 import ssl
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-
 
 # --------------------
 # Configuration
@@ -45,7 +42,7 @@ SITES: Dict[str, str] = {
     "CYFENDUS": "https://www.usaspending.gov/award/CONT_AWD_HHSO100201600030C_7505_-NONE-_-NONE-",
 }
 
-# The XPath you specified
+# The table container on USAspending
 TABLE_XPATH = '//div[@class="results-table-content"]'
 
 # Where to store state (CSV snapshots)
@@ -53,19 +50,22 @@ STATE_DIR = Path("state")
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Email / SMTP settings come from environment variables (set in GitHub Secrets)
-GMAIL_USERNAME      = os.environ.get("GMAIL_USERNAME", "").strip()
-GMAIL_APP_PASSWORD  = os.environ.get("GMAIL_APP_PASSWORD", "").strip()  # App Password required
-EMAIL_RECIPIENTS    = [x.strip() for x in os.environ.get("EMAIL_RECIPIENTS", "").split(",") if x.strip()]
-EMAIL_SENDER_NAME   = os.environ.get("EMAIL_SENDER_NAME", "USAspending Watcher").strip()
+GMAIL_USERNAME       = os.environ.get("GMAIL_USERNAME", "").strip()
+GMAIL_APP_PASSWORD   = os.environ.get("GMAIL_APP_PASSWORD", "").strip()  # App Password required
+EMAIL_RECIPIENTS     = [x.strip() for x in os.environ.get("EMAIL_RECIPIENTS", "").split(",") if x.strip()]
+EMAIL_SENDER_NAME    = os.environ.get("EMAIL_SENDER_NAME", "USAspending Watcher").strip()
 EMAIL_SUBJECT_PREFIX = os.environ.get("EMAIL_SUBJECT_PREFIX", "[Award Watch]").strip()
 
 # Optional: set to "1" to skip sending email (useful for first run/tests)
 DRY_RUN = os.environ.get("DRY_RUN", "0").strip() == "1"
 
 # Playwright timeouts (ms)
-NAV_TIMEOUT_MS = 10_000
+NAV_TIMEOUT_MS   = 10_000
 TABLE_TIMEOUT_MS = 10_000
+ROW_TIMEOUT_MS   = 30_000  # wait for real rows
 
+# Scrape retries
+MAX_SCRAPE_RETRIES = 3
 
 # --------------------
 # Helpers
@@ -74,26 +74,21 @@ TABLE_TIMEOUT_MS = 10_000
 def now_utc_iso() -> str:
     return datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
 
-
 def normalize_space(s: str) -> str:
-    return re.sub(r"\s+", " ", s.replace("\xa0", " ")).strip()
-
+    return re.sub(r"\s+", " ", (s or "").replace("\xa0", " ")).strip()
 
 def normalize_amount(s: str) -> str:
-    """Normalize currency strings for comparison (keep sign and digits)."""
+    """Normalize currency strings for comparison (keep sign and digits, handle parentheses negatives)."""
     if s is None:
         return ""
     s = s.strip()
-    # Keep a leading '-' if present; remove everything except digits and dot
-    neg = s.startswith("-")
+    neg = s.startswith("-") or ("(" in s and ")" in s)
     digits = re.sub(r"[^\d.]", "", s)
     if digits == "":
         return "0"
     return f"-{digits}" if neg else digits
 
-
 def canonicalize_row(row: Dict[str, str], amount_cols=("Amount",)) -> Dict[str, str]:
-    """Return a normalized copy of a table row for stable comparisons."""
     out = {}
     for k, v in row.items():
         vs = normalize_space(str(v))
@@ -102,73 +97,58 @@ def canonicalize_row(row: Dict[str, str], amount_cols=("Amount",)) -> Dict[str, 
         out[k] = vs
     return out
 
-
 def read_csv_if_exists(path: Path) -> List[Dict[str, str]]:
-    if not path.exists():
+    if not path.exists() or path.stat().st_size == 0:
         return []
     with path.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        rows = [dict(r) for r in reader]
-    return rows
+        return [dict(r) for r in reader]
 
-
-def write_csv(path: Path, rows: List[Dict[str, str]]):
+def write_csv_atomic(path: Path, rows: List[Dict[str, str]]) -> None:
+    """Always write atomically to avoid partial/blank files."""
     if not rows:
-        # If no rows, write an empty file with known headers
-        with path.open("w", newline="", encoding="utf-8") as f:
-            f.write("")  # keep empty; or write headers if desired
+        # Caller should guard empties; do nothing to avoid clobbering good state.
         return
     headers = list(rows[0].keys())
-    with path.open("w", newline="", encoding="utf-8") as f:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
-
+        writer.writerows(rows)
+    tmp.replace(path)
 
 def detect_changes(
     old_rows: List[Dict[str, str]],
     new_rows: List[Dict[str, str]],
     key_col: str = "Modification Number"
 ) -> Tuple[List[Dict[str, str]], List[Tuple[str, Dict[str, str], Dict[str, str]]]]:
-    """
-    Compare old vs new.
-    Returns:
-      - new_entries: list of newly added rows (not present before)
-      - updated_entries: list of (key, old_row, new_row) where row exists but changed
-    Ignores deletions (per your instruction to include only new changes).
-    """
-
-    # Canonicalize both sides for comparison
     old_norm = [canonicalize_row(r) for r in old_rows]
     new_norm = [canonicalize_row(r) for r in new_rows]
 
-    # Index by key if available; if not, fallback to full row signature
     def row_key(r: Dict[str, str]) -> str:
-        if key_col in r and r[key_col]:
-            return r[key_col]
-        # fallback signature
-        return json.dumps(r, sort_keys=True, ensure_ascii=False)
+        v = r.get(key_col, "")
+        return v if v else json.dumps(r, sort_keys=True, ensure_ascii=False)
 
     old_map = {row_key(r): r for r in old_norm}
     new_map = {row_key(r): r for r in new_norm}
 
     # New entries
-    new_entries_keys = [k for k in new_map.keys() if k not in old_map]
-    new_entries = [new_rows[new_norm.index(new_map[k])] for k in new_entries_keys]  # original (un-normalized)
+    new_entries = []
+    for k, norm in new_map.items():
+        if k not in old_map:
+            # find original un-normalized by index in new_norm
+            idx = new_norm.index(norm)
+            new_entries.append(new_rows[idx])
 
-    # Updated entries (present in both but content differs)
+    # Updated entries
     updated: List[Tuple[str, Dict[str, str], Dict[str, str]]] = []
-    for k in new_map.keys():
-        if k in old_map:
-            if new_map[k] != old_map[k]:
-                # Recover original (un-normalized) rows for reporting
-                old_orig = old_rows[old_norm.index(old_map[k])]
-                new_orig = new_rows[new_norm.index(new_map[k])]
-                updated.append((k, old_orig, new_orig))
+    for k, new_norm_row in new_map.items():
+        if k in old_map and new_norm_row != old_map[k]:
+            old_idx = old_norm.index(old_map[k])
+            new_idx = new_norm.index(new_norm_row)
+            updated.append((k, old_rows[old_idx], new_rows[new_idx]))
 
     return new_entries, updated
-
 
 def format_change_lines(
     name: str,
@@ -177,45 +157,33 @@ def format_change_lines(
     updated_entries: List[Tuple[str, Dict[str, str], Dict[str, str]]],
     key_col: str = "Modification Number"
 ) -> List[str]:
-    """
-    Create human-friendly bullet lines describing only the new/updated items.
-    """
     lines: List[str] = []
 
-    # New rows
     for row in new_entries:
         parts = []
-        if key_col in row and row[key_col]:
-            parts.append(f"New entry (Mod #{row[key_col]})")
-        else:
-            parts.append("New entry")
-        # Display common fields if present
+        mod = row.get(key_col, "")
+        parts.append(f"New entry (Mod #{mod})" if mod else "New entry")
         for col in ["Action Date", "Amount", "Action Type", "Transaction Description"]:
-            if col in row and row[col]:
+            if row.get(col):
                 parts.append(f"{col}: {row[col]}")
         lines.append(" - " + " | ".join(parts))
 
-    # Updated rows: show only fields that changed
     for key, old_r, new_r in updated_entries:
         changed_cols = []
-        # Compare after normalization to avoid noise
         old_norm = canonicalize_row(old_r)
         new_norm = canonicalize_row(new_r)
         for col in headers:
             if old_norm.get(col, "") != new_norm.get(col, ""):
                 changed_cols.append(col)
 
-        header = f"Updated (Mod #{new_r.get(key_col, key)}):"
-        details = []
-        for col in changed_cols:
-            old_val = old_r.get(col, "")
-            new_val = new_r.get(col, "")
-            details.append(f"{col}: {old_val} → {new_val}")
-        if details:
+        if changed_cols:
+            header = f"Updated (Mod #{new_r.get(key_col, key)}):"
+            details = []
+            for col in changed_cols:
+                details.append(f"{col}: {old_r.get(col, '')} → {new_r.get(col, '')}")
             lines.append(" - " + header + " " + "; ".join(details))
 
     return lines
-
 
 def send_email_digest(
     subject_prefix: str,
@@ -225,11 +193,6 @@ def send_email_digest(
     recipients: List[str],
     per_name_lines: Dict[str, List[str]]
 ):
-    """
-    Send a single HTML+text email with grouped sections:
-    <strong>NAME</strong> followed by bullet points of new/updated items.
-    """
-
     if not recipients:
         print("[email] No recipients configured; skipping send.")
         return
@@ -237,7 +200,6 @@ def send_email_digest(
     date_str = datetime.now().strftime("%Y-%m-%d")
     subject = f"{subject_prefix} USAspending Award Changes — {date_str}"
 
-    # Build HTML body
     html_parts: List[str] = []
     text_parts: List[str] = []
     html_parts.append(f"<p>Detected changes at {now_utc_iso()}:</p>")
@@ -263,10 +225,8 @@ def send_email_digest(
     msg["From"] = f"{sender_name} <{gmail_username}>"
     msg["To"] = ", ".join(recipients)
 
-    part1 = MIMEText(text_body, "plain", "utf-8")
-    part2 = MIMEText(html_body, "html", "utf-8")
-    msg.attach(part1)
-    msg.attach(part2)
+    msg.attach(MIMEText(text_body, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     context = ssl.create_default_context()
     with smtplib.SMTP("smtp.gmail.com", 587, timeout=60) as server:
@@ -276,15 +236,62 @@ def send_email_digest(
         server.sendmail(gmail_username, recipients, msg.as_string())
         print(f"[email] Sent digest to {len(recipients)} recipient(s).")
 
-
 # --------------------
 # Scraping
 # --------------------
 
-MAX_SCRAPE_RETRIES = 3
+def wait_for_table_rows(page, container_xpath: str, min_rows: int = 1, timeout_ms: int = ROW_TIMEOUT_MS):
+    """Wait until the table under container_xpath has at least min_rows rows in <tbody>."""
+    page.wait_for_selector(f"{container_xpath}//table", state="attached", timeout=timeout_ms)
+    # Ensure scrolled into view (helps some virtualized tables)
+    try:
+        page.locator(f"xpath={container_xpath}").scroll_into_view_if_needed(timeout=1000)
+    except Exception:
+        pass
+    page.wait_for_function(
+        """
+        (containerXPath, minRows) => {
+            const el = document.evaluate(containerXPath + "//table", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+            if (!el) return false;
+            const rows = el.querySelectorAll("tbody tr");
+            return rows && rows.length >= minRows;
+        }
+        """,
+        arg=[container_xpath, min_rows],
+        timeout=timeout_ms,
+    )
+
+def expand_read_more_safely(page, container_xpath: str, max_passes: int = 8, per_pass_cap: int = 200):
+    """
+    Expand collapsed 'Read more' toggles without getting stuck.
+    Click only 'read more' (not 'read less'); cap passes and clicks.
+    """
+    prev_count = None
+    for _ in range(max_passes):
+        sel = (
+            f"{container_xpath}//button"
+            "[contains(translate(normalize-space(string(.)),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'read more')"
+            " or @aria-expanded='false']"
+        )
+        loc = page.locator(f"xpath={sel}")
+        try:
+            count = loc.count()
+        except Exception:
+            break
+        if count == 0 or count == prev_count:
+            break
+        prev_count = count
+
+        for i in range(min(count, per_pass_cap)):
+            try:
+                loc.nth(i).click(timeout=1000)
+            except Exception:
+                pass
+
+        page.wait_for_timeout(250)  # let DOM settle
 
 def scrape_table_rows(page, url: str) -> Tuple[List[str], List[Dict[str, str]]]:
-    last_err = None
+    last_err: Exception | None = None
     for attempt in range(1, MAX_SCRAPE_RETRIES + 1):
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
@@ -292,9 +299,9 @@ def scrape_table_rows(page, url: str) -> Tuple[List[str], List[Dict[str, str]]]:
             try:
                 page.wait_for_load_state("networkidle", timeout=8_000)
             except Exception:
-                pass  # don't fail just because network stays chatty
+                pass
 
-            # Best-effort: ensure the "Transactions" tab is active
+            # Try to activate the "Transactions" tab if present
             try:
                 tab = page.get_by_role("tab", name=re.compile(r"^Transactions", re.I))
                 if tab.is_visible():
@@ -369,14 +376,13 @@ def scrape_table_rows(page, url: str) -> Tuple[List[str], List[Dict[str, str]]]:
 
         except Exception as e:
             last_err = e
-            # Diagnostics on final failure
             if attempt == MAX_SCRAPE_RETRIES:
                 ts = datetime.now().strftime("%Y%m%d-%H%M%S")
                 try:
-                    Path("state").mkdir(exist_ok=True)
-                    page.screenshot(path=f"state/{ts}_fail.png", full_page=True)
-                    Path(f"state/{ts}_fail.html").write_text(page.content(), encoding="utf-8")
-                    print(f"[scrape][DIAG] Saved state/{ts}_fail.png and state/{ts}_fail.html")
+                    STATE_DIR.mkdir(exist_ok=True)
+                    page.screenshot(path=str(STATE_DIR / f"{ts}_fail.png"), full_page=True)
+                    (STATE_DIR / f"{ts}_fail.html").write_text(page.content(), encoding="utf-8")
+                    print(f"[scrape][DIAG] Saved {STATE_DIR}/{ts}_fail.png and {STATE_DIR}/{ts}_fail.html")
                 except Exception:
                     pass
                 break
@@ -388,36 +394,6 @@ def scrape_table_rows(page, url: str) -> Tuple[List[str], List[Dict[str, str]]]:
                 pass
 
     raise last_err if last_err else RuntimeError("Unknown scrape failure")
-    
-def expand_read_more_safely(page, container_xpath: str, max_passes: int = 8, per_pass_cap: int = 200):
-    """
-    Expand collapsed 'Read more' toggles without getting stuck.
-    Click only 'read more' (not 'read less'), cap passes and clicks.
-    """
-    prev_count = None
-    for _ in range(max_passes):
-        sel = (
-            f"{container_xpath}//button"
-            "[contains(translate(normalize-space(string(.)),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'read more')"
-            " or @aria-expanded='false']"
-        )
-        loc = page.locator(f"xpath={sel}")
-        try:
-            count = loc.count()
-        except Exception:
-            break
-
-        if count == 0 or count == prev_count:
-            break
-        prev_count = count
-
-        for i in range(min(count, per_pass_cap)):
-            try:
-                loc.nth(i).click(timeout=1000)
-            except Exception:
-                pass
-
-        page.wait_for_timeout(250)  # let DOM settle
 
 def scrape_all_sites() -> Dict[str, Dict[str, Any]]:
     """
@@ -425,7 +401,14 @@ def scrape_all_sites() -> Dict[str, Dict[str, Any]]:
     """
     results: Dict[str, Dict[str, Any]] = {}
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+            ],
+        )
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -433,7 +416,7 @@ def scrape_all_sites() -> Dict[str, Dict[str, Any]]:
             ),
             viewport={"width": 1366, "height": 900},
         )
-        
+
         page = context.new_page()
         page.set_default_timeout(15_000)
         page.set_default_navigation_timeout(15_000)
@@ -452,29 +435,6 @@ def scrape_all_sites() -> Dict[str, Dict[str, Any]]:
         context.close()
         browser.close()
     return results
-
-ROW_TIMEOUT_MS = 30_000  # how long to wait for actual table rows
-
-def wait_for_table_rows(page, container_xpath: str, min_rows: int = 1, timeout_ms: int = ROW_TIMEOUT_MS):
-    """
-    Wait until the table under container_xpath has at least min_rows rows in <tbody>.
-    """
-    # Ensure the table exists first
-    page.wait_for_selector(f"{container_xpath}//table", state="attached", timeout=timeout_ms)
-
-    # Now wait for rows to appear (or throw)
-    page.wait_for_function(
-        """
-        (containerXPath, minRows) => {
-            const el = document.evaluate(containerXPath + "//table", document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-            if (!el) return false;
-            const rows = el.querySelectorAll("tbody tr");
-            return rows && rows.length >= minRows;
-        }
-        """,
-        arg=[container_xpath, min_rows],
-        timeout=timeout_ms,
-    )
 
 # --------------------
 # Main flow
@@ -495,23 +455,19 @@ def main() -> int:
         headers = payload["headers"]
         new_rows = payload["rows"]
 
-        # Path for this award's CSV snapshot
         csv_path = STATE_DIR / f"{name}.csv"
-
-        # Load old rows (if any)
         old_rows = read_csv_if_exists(csv_path)
 
+        # First-time snapshot: only write if we actually have rows.
         if not old_rows:
             if new_rows:
                 print(f"[state] Initializing snapshot for {name} -> {csv_path}")
-                tmp = csv_path.with_suffix(".csv.tmp")
-                write_csv(tmp, new_rows)
-                tmp.replace(csv_path)  # atomic
+                write_csv_atomic(csv_path, new_rows)
             else:
                 print(f"[state][WARN] {name}: initial scrape returned 0 rows; snapshot not created.")
             continue
-        
-        # Subsequent runs: skip if scrape is empty
+
+        # Subsequent runs: skip entirely if scrape is empty (never clobber with empties)
         if not new_rows:
             print(f"[warn] {name}: scrape returned 0 rows; keeping previous snapshot and skipping diff.")
             continue
@@ -524,8 +480,8 @@ def main() -> int:
             lines = format_change_lines(name, headers, new_entries, updated_entries, key_col="Modification Number")
             digest_by_name[name] = lines
 
-            # Update snapshot immediately so repo gets the latest
-            write_csv(csv_path, new_rows)
+            # Update snapshot atomically
+            write_csv_atomic(csv_path, new_rows)
             print(f"[diff] {name}: {len(new_entries)} new, {len(updated_entries)} updated")
         else:
             print(f"[diff] {name}: no changes")
@@ -552,7 +508,6 @@ def main() -> int:
 
     print("[end] Done.")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
